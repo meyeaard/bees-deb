@@ -1,0 +1,371 @@
+name: Build BEES Debian Package
+
+on:
+  schedule:
+    # Runs daily at 06:17 UTC.
+    # GitHub scheduled workflows use cron-style schedules.
+    - cron: '17 6 * * *'
+
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Optional BEES upstream tag, for example v0.11. Leave blank for latest tag.'
+        required: false
+        default: ''
+      package_revision:
+        description: 'Debian package revision, for example 1, 2, 3.'
+        required: true
+        default: '1'
+      force_rebuild:
+        description: 'Build even if this package version was already built.'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: bees-deb-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and validate package
+    runs-on: ubuntu-latest
+
+    outputs:
+      package_version: ${{ steps.version.outputs.package_version }}
+      should_build: ${{ steps.version.outputs.should_build }}
+
+    steps:
+      - name: Check out packaging repository
+        uses: actions/checkout@v4
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            ca-certificates \
+            gzip \
+            dpkg-dev
+
+      - name: Determine upstream BEES tag and package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p state
+
+          INPUT_TAG="${{ github.event.inputs.upstream_tag || '' }}"
+          PACKAGE_REVISION="${{ github.event.inputs.package_revision || '1' }}"
+          FORCE_REBUILD="${{ github.event.inputs.force_rebuild || 'false' }}"
+
+          if [ -n "$INPUT_TAG" ]; then
+            UPSTREAM_TAG="$INPUT_TAG"
+          else
+            UPSTREAM_TAG="$(git ls-remote --tags --refs https://github.com/Zygo/bees.git \
+              | awk '{print $2}' \
+              | sed 's#refs/tags/##' \
+              | grep -E '^v?[0-9]+(\.[0-9]+)*$' \
+              | sort -V \
+              | tail -n 1)"
+          fi
+
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "Could not determine upstream BEES tag."
+            exit 1
+          fi
+
+          UPSTREAM_VERSION="${UPSTREAM_TAG#v}"
+          PACKAGE_VERSION="${UPSTREAM_VERSION}-${PACKAGE_REVISION}"
+
+          echo "Upstream tag: $UPSTREAM_TAG"
+          echo "Upstream version: $UPSTREAM_VERSION"
+          echo "Package version: $PACKAGE_VERSION"
+
+          if [ -f state/last_package_version.txt ]; then
+            LAST_PACKAGE_VERSION="$(cat state/last_package_version.txt)"
+          else
+            LAST_PACKAGE_VERSION=""
+          fi
+
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            SHOULD_BUILD="true"
+          elif [ "$PACKAGE_VERSION" = "$LAST_PACKAGE_VERSION" ]; then
+            SHOULD_BUILD="false"
+          else
+            SHOULD_BUILD="true"
+          fi
+
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+          echo "package_revision=$PACKAGE_REVISION" >> "$GITHUB_OUTPUT"
+          echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if package is already current
+        if: steps.version.outputs.should_build == 'false'
+        run: |
+          echo "Package version ${{ steps.version.outputs.package_version }} was already built. Nothing to do."
+
+      - name: Build BEES package inside Debian 13 container
+        if: steps.version.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_TAG="${{ steps.version.outputs.upstream_tag }}"
+          UPSTREAM_VERSION="${{ steps.version.outputs.upstream_version }}"
+          PACKAGE_VERSION="${{ steps.version.outputs.package_version }}"
+
+          mkdir -p build output
+
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            debian:trixie \
+            bash -lc "
+              set -euo pipefail
+
+              apt-get update
+
+              apt-get install -y \
+                git \
+                build-essential \
+                btrfs-progs \
+                markdown \
+                util-linux \
+                dpkg-dev \
+                ca-certificates \
+                file \
+                systemd
+
+              rm -rf build/bees-src build/pkgroot
+
+              git clone --branch \"$UPSTREAM_TAG\" --depth 1 https://github.com/Zygo/bees.git build/bees-src
+
+              cd build/bees-src
+              make
+
+              cd /work
+
+              mkdir -p build/pkgroot/DEBIAN
+              mkdir -p build/pkgroot/usr/bin
+              mkdir -p build/pkgroot/usr/sbin
+              mkdir -p build/pkgroot/lib/systemd/system
+              mkdir -p build/pkgroot/usr/share/doc/bees
+
+              install -m 0755 build/bees-src/bin/bees build/pkgroot/usr/bin/bees
+              install -m 0755 build/bees-src/scripts/beesd build/pkgroot/usr/sbin/beesd
+
+              if [ -f build/bees-src/scripts/beesd@.service ]; then
+                install -m 0644 build/bees-src/scripts/beesd@.service build/pkgroot/lib/systemd/system/beesd@.service
+              elif [ -f build/bees-src/scripts/beesd@.service.in ]; then
+                sed 's#@BINDIR@#/usr/bin#g; s#@SBINDIR@#/usr/sbin#g' \
+                  build/bees-src/scripts/beesd@.service.in \
+                  > build/pkgroot/lib/systemd/system/beesd@.service
+                chmod 0644 build/pkgroot/lib/systemd/system/beesd@.service
+              else
+                echo 'Could not locate beesd@.service or beesd@.service.in'
+                exit 1
+              fi
+
+              if [ -f build/bees-src/COPYING ]; then
+                install -m 0644 build/bees-src/COPYING build/pkgroot/usr/share/doc/bees/copyright
+              fi
+
+              cat > build/pkgroot/DEBIAN/control <<EOF
+Package: bees
+Version: $PACKAGE_VERSION
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: YOUR NAME <you@example.com>
+Depends: btrfs-progs, util-linux, \${shlibs:Depends}, \${misc:Depends}
+Description: BEES Btrfs deduplication agent
+ BEES is a block-oriented userspace deduplication agent for Btrfs.
+ This package was built from upstream Zygo/bees tag $UPSTREAM_TAG.
+EOF
+
+              cat > build/pkgroot/DEBIAN/postinst <<'EOF'
+#!/bin/sh
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || true
+fi
+
+exit 0
+EOF
+              chmod 0755 build/pkgroot/DEBIAN/postinst
+
+              cat > build/pkgroot/DEBIAN/prerm <<'EOF'
+#!/bin/sh
+set -e
+
+# Do not blindly stop beesd@*.service here because wildcard service
+# handling can vary by environment and admin policy. The package leaves
+# running instance management to the administrator.
+
+exit 0
+EOF
+              chmod 0755 build/pkgroot/DEBIAN/prerm
+
+              dpkg-shlibdeps -O build/pkgroot/usr/bin/bees > build/shlibs.substvars || true
+
+              if [ -f build/shlibs.substvars ]; then
+                SHLIBS_DEPENDS=\$(sed -n 's/^shlibs:Depends=//p' build/shlibs.substvars | head -n 1)
+                if [ -n \"\$SHLIBS_DEPENDS\" ]; then
+                  sed -i \"s#\\\${shlibs:Depends}#\$SHLIBS_DEPENDS#g\" build/pkgroot/DEBIAN/control
+                else
+                  sed -i 's#, \${shlibs:Depends}##g' build/pkgroot/DEBIAN/control
+                fi
+              else
+                sed -i 's#, \${shlibs:Depends}##g' build/pkgroot/DEBIAN/control
+              fi
+
+              sed -i 's#, \${misc:Depends}##g' build/pkgroot/DEBIAN/control
+
+              dpkg-deb --build build/pkgroot \"output/bees_${PACKAGE_VERSION}_amd64.deb\"
+            "
+
+      - name: Validate package contents
+        if: steps.version.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_VERSION="${{ steps.version.outputs.package_version }}"
+          DEB="output/bees_${PACKAGE_VERSION}_amd64.deb"
+
+          test -f "$DEB"
+
+          echo "Package info:"
+          dpkg-deb --info "$DEB"
+
+          echo "Package contents:"
+          dpkg-deb --contents "$DEB"
+
+          dpkg-deb --contents "$DEB" | grep -q 'usr/bin/bees'
+          dpkg-deb --contents "$DEB" | grep -q 'usr/sbin/beesd'
+          dpkg-deb --contents "$DEB" | grep -q 'lib/systemd/system/beesd@.service'
+
+      - name: Validate installability in Debian 13 container
+        if: steps.version.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_VERSION="${{ steps.version.outputs.package_version }}"
+          DEB="bees_${PACKAGE_VERSION}_amd64.deb"
+
+          docker run --rm \
+            -v "$PWD/output:/packages:ro" \
+            debian:trixie \
+            bash -lc "
+              set -euo pipefail
+
+              apt-get update
+              apt-get install -y /packages/$DEB
+
+              test -x /usr/bin/bees
+              test -x /usr/sbin/beesd
+              test -f /lib/systemd/system/beesd@.service
+
+              ldd /usr/bin/bees
+
+              systemd-analyze verify /lib/systemd/system/beesd@.service || true
+
+              dpkg -s bees
+              dpkg -L bees
+            "
+
+      - name: Build APT repository directory
+        if: steps.version.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_VERSION="${{ steps.version.outputs.package_version }}"
+
+          mkdir -p public/pool/main/b/bees
+
+          cp "output/bees_${PACKAGE_VERSION}_amd64.deb" public/pool/main/b/bees/
+
+          cd public
+
+          dpkg-scanpackages pool /dev/null > Packages
+          gzip -k -f Packages
+
+          cat > index.html <<EOF
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>BEES Debian Package Repository</title>
+</head>
+<body>
+  <h1>BEES Debian Package Repository</h1>
+  <p>Latest package version: ${PACKAGE_VERSION}</p>
+  <p>APT source example:</p>
+  <pre>deb [trusted=yes] https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/} ./</pre>
+</body>
+</html>
+EOF
+
+      - name: Upload package artifact
+        if: steps.version.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bees-deb-package
+          path: output/*.deb
+          retention-days: 30
+
+      - name: Upload Pages artifact
+        if: steps.version.outputs.should_build == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Record built package version
+        if: steps.version.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_VERSION="${{ steps.version.outputs.package_version }}"
+
+          mkdir -p state
+          echo "$PACKAGE_VERSION" > state/last_package_version.txt
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add state/last_package_version.txt
+          git commit -m "Record built BEES package ${PACKAGE_VERSION}" || echo "No state change to commit"
+          git push
+
+  deploy:
+    name: Publish APT repository to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build
+
+    if: needs.build.outputs.should_build == 'true'
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
